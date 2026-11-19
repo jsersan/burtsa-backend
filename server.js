@@ -269,6 +269,89 @@ app.get('/', (_req, res) => {
   });
 });
 
+// ===========================================================================
+// HISTÓRICO para gráficas e indicadores técnicos.
+// PEGAR en server.js JUSTO ANTES del bloque "// 404" (no sustituye nada).
+// Reutiliza axios, YAHOO_HOSTS, YAHOO_HEADERS y limit() que ya existen en el
+// server.js de la versión 1.1.0.
+// ===========================================================================
+const HISTORY_TTL_MS = 30 * 60 * 1000;       // el dato diario cambia poco: 30 min
+const HISTORY_STALE_MAX_MS = 24 * 60 * 60 * 1000;
+const historyCache = new Map();               // SYMBOL -> { ts, data }
+const historyInflight = new Map();
+
+async function fetchHistory(symbol) {
+  let lastError;
+  for (const host of YAHOO_HOSTS) {
+    try {
+      const { data } = await axios.get(
+        `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}`,
+        { params: { interval: '1d', range: '5y' }, headers: YAHOO_HEADERS, timeout: 20000 }
+      );
+      const result = data && data.chart && data.chart.result && data.chart.result[0];
+      if (!result || !Array.isArray(result.timestamp)) {
+        const desc = data && data.chart && data.chart.error && data.chart.error.description;
+        throw new Error(desc || 'Yahoo no devolvió histórico');
+      }
+      const q = (result.indicators && result.indicators.quote && result.indicators.quote[0]) || {};
+      const candles = [];
+      result.timestamp.forEach((t, i) => {
+        const c = q.close && q.close[i];
+        if (c == null) return; // sesiones sin dato
+        candles.push({
+          t,
+          o: q.open && q.open[i] != null ? q.open[i] : c,
+          h: q.high && q.high[i] != null ? q.high[i] : c,
+          l: q.low && q.low[i] != null ? q.low[i] : c,
+          c,
+          v: q.volume && q.volume[i] != null ? q.volume[i] : 0
+        });
+      });
+      if (!candles.length) throw new Error('Histórico vacío');
+      return { symbol, currency: (result.meta && result.meta.currency) || 'EUR', candles };
+    } catch (err) {
+      lastError = err;
+      const status = err.response && err.response.status;
+      console.warn(`Yahoo (${host}) histórico falló para ${symbol}: ${status || ''} ${err.message}`);
+      if (status === 404) break;
+    }
+  }
+  throw lastError;
+}
+
+async function getHistory(symbol) {
+  const key = symbol.toUpperCase();
+  const hit = historyCache.get(key);
+  if (hit && Date.now() - hit.ts < HISTORY_TTL_MS) return { ...hit.data, stale: false };
+  if (historyInflight.has(key)) return historyInflight.get(key);
+
+  const p = limit(() => fetchHistory(key))
+    .then((data) => {
+      historyCache.set(key, { ts: Date.now(), data });
+      return { ...data, stale: false };
+    })
+    .catch((err) => {
+      if (hit && Date.now() - hit.ts < HISTORY_STALE_MAX_MS) return { ...hit.data, stale: true };
+      throw err;
+    })
+    .finally(() => historyInflight.delete(key));
+  historyInflight.set(key, p);
+  return p;
+}
+
+// GET /api/history/:symbol  ->  { symbol, currency, candles:[{t,o,h,l,c,v}], stale }
+app.get('/api/history/:symbol', async (req, res) => {
+  const { symbol } = req.params;
+  if (!/^[\^A-Za-z0-9.\-=]{1,20}$/.test(symbol)) {
+    return res.status(400).json({ error: 'Símbolo no válido' });
+  }
+  try {
+    res.json(await getHistory(symbol));
+  } catch (error) {
+    sendUpstreamError(res, 'el histórico', symbol, error);
+  }
+});
+
 // 404
 app.use((_req, res) => {
   res.status(404).json({ error: 'Endpoint no encontrado' });
