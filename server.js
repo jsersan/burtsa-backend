@@ -259,11 +259,13 @@ app.get('/health', (_req, res) => {
 app.get('/', (_req, res) => {
   res.json({
     name: 'Burtsa Backend API',
-    version: '1.1.0',
+    version: '1.2.0',
     endpoints: {
       quote: '/api/quote/:symbol',
       index: '/api/index/:symbol',
       quotes: '/api/quotes?symbols=SAN.MC,BBVA.MC',
+      history: '/api/history/:symbol',
+      check: '/api/check/:symbol',
       health: '/health'
     }
   });
@@ -275,7 +277,7 @@ app.get('/', (_req, res) => {
 // Reutiliza axios, YAHOO_HOSTS, YAHOO_HEADERS y limit() que ya existen en el
 // server.js de la versión 1.1.0.
 // ===========================================================================
-const HISTORY_TTL_MS = 30 * 60 * 1000;       // el dato diario cambia poco: 30 min
+const HISTORY_TTL_MS = 5 * 60 * 1000;        // la última vela es la sesión EN CURSO: caché corta (5 min)
 const HISTORY_STALE_MAX_MS = 24 * 60 * 60 * 1000;
 const historyCache = new Map();               // SYMBOL -> { ts, data }
 const historyInflight = new Map();
@@ -308,7 +310,12 @@ async function fetchHistory(symbol) {
         });
       });
       if (!candles.length) throw new Error('Histórico vacío');
-      return { symbol, currency: (result.meta && result.meta.currency) || 'EUR', candles };
+      return {
+        symbol,
+        currency: (result.meta && result.meta.currency) || 'EUR',
+        asOf: (result.meta && result.meta.regularMarketTime) || candles[candles.length - 1].t, // UNIX s
+        candles
+      };
     } catch (err) {
       lastError = err;
       const status = err.response && err.response.status;
@@ -352,6 +359,58 @@ app.get('/api/history/:symbol', async (req, res) => {
   }
 });
 
+
+// GET /api/check/:symbol
+// Contrasta la cotización y el histórico para detectar datos incoherentes o atrasados.
+// OJO: no "certifica" nada (Yahoo es una fuente no oficial); solo comprueba que lo que
+// devuelve es coherente consigo mismo y te da las cifras para compararlas con tu bróker.
+app.get('/api/check/:symbol', async (req, res) => {
+  const { symbol } = req.params;
+  if (!/^[\^A-Za-z0-9.\-=]{1,20}$/.test(symbol)) {
+    return res.status(400).json({ error: 'Símbolo no válido' });
+  }
+  try {
+    const [q, h] = await Promise.all([getChart(symbol), getHistory(symbol)]);
+    const meta = q.result.meta || {};
+    const price = meta.regularMarketPrice;
+    const prevQuote = pick(meta.chartPreviousClose, meta.previousClose);
+    const candles = h.candles;
+    const last = candles[candles.length - 1];
+
+    const off = meta.gmtoffset || 0;
+    const day = (t) => Math.floor((t + off) / 86400);
+    const todayInHistory = day(last.t) === day(meta.regularMarketTime);
+    const prevHistory = todayInHistory && candles.length > 1 ? candles[candles.length - 2].c : last.c;
+
+    const prevDiffPct = (Math.abs(prevQuote - prevHistory) / prevHistory) * 100;
+    const priceDiffPct = todayInHistory ? (Math.abs(price - last.c) / last.c) * 100 : null;
+    const checks = {
+      previousCloseMatchesHistory: prevDiffPct < 0.5,
+      priceMatchesLastCandle: priceDiffPct == null || priceDiffPct < 2
+    };
+    const r4 = (n) => (n == null ? null : Math.round(n * 10000) / 10000);
+
+    res.json({
+      symbol,
+      currency: h.currency,
+      price: r4(price),
+      priceTime: new Date(meta.regularMarketTime * 1000).toISOString(),
+      priceAgeMinutes: Math.round((Date.now() / 1000 - meta.regularMarketTime) / 60),
+      previousClose: r4(prevQuote),
+      previousCloseFromHistory: r4(prevHistory),
+      lastCandleDate: new Date(last.t * 1000).toISOString(),
+      lastCandleIsToday: todayInHistory,
+      diffPct: { previousClose: r4(prevDiffPct), priceVsLastCandle: r4(priceDiffPct) },
+      checks,
+      ok: Object.values(checks).every(Boolean),
+      stale: { quote: q.stale === true, history: h.stale === true },
+      note: 'Compara price y previousClose con la web de tu bróker. Yahoo puede ir con retraso en algunas bolsas.'
+    });
+  } catch (error) {
+    sendUpstreamError(res, 'la verificación', symbol, error);
+  }
+});
+
 // 404
 app.use((_req, res) => {
   res.status(404).json({ error: 'Endpoint no encontrado' });
@@ -369,5 +428,5 @@ process.on('uncaughtException', (err) => console.error('uncaughtException:', err
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\nBackend corriendo en puerto ${PORT}`);
-  console.log('Endpoints: /api/quote/:symbol  /api/index/:symbol  /api/quotes  /health\n');
+  console.log('Endpoints: /api/quote/:symbol  /api/index/:symbol  /api/quotes  /api/history/:symbol  /api/check/:symbol  /health\n');
 });
