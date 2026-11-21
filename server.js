@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { analyze } = require('./technical-analysis'); // mismo cálculo que el frontend
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -259,13 +260,14 @@ app.get('/health', (_req, res) => {
 app.get('/', (_req, res) => {
   res.json({
     name: 'Burtsa Backend API',
-    version: '1.2.0',
+    version: '1.3.0',
     endpoints: {
       quote: '/api/quote/:symbol',
       index: '/api/index/:symbol',
       quotes: '/api/quotes?symbols=SAN.MC,BBVA.MC',
       history: '/api/history/:symbol',
       check: '/api/check/:symbol',
+      recommendations: '/api/recommendations?symbols=ACX.MC,BKT.MC',
       health: '/health'
     }
   });
@@ -359,6 +361,40 @@ app.get('/api/history/:symbol', async (req, res) => {
   }
 });
 
+
+// GET /api/recommendations?symbols=ACX.MC,BKT.MC,...
+// Devuelve solo la valoración técnica (label, level, gauge) de cada valor, calculada con el
+// MISMO código y el MISMO histórico de 5 años que la pantalla de detalle. Así la tabla del
+// IBEX 35 no tiene que descargar 35 históricos completos (~4 MB) en el navegador.
+app.get('/api/recommendations', async (req, res) => {
+  const symbols = [...new Set(
+    String(req.query.symbols || '').split(',').map((s) => s.trim()).filter(Boolean)
+  )].slice(0, 60);
+  if (!symbols.length) return res.status(400).json({ error: 'Falta el parámetro symbols' });
+
+  const valid = /^[\^A-Za-z0-9.\-=]{1,20}$/;
+  const settled = await Promise.allSettled(
+    symbols.map(async (s) => {
+      if (!valid.test(s)) throw new Error('Símbolo no válido');
+      const h = await getHistory(s);
+      const a = analyze(h.candles);
+      if (!a) throw new Error('Histórico insuficiente');
+      return {
+        label: a.recommendation.label,
+        level: a.recommendation.level,
+        gauge: a.recommendation.gauge,
+        price: a.price,
+        asOf: h.asOf,
+        stale: h.stale === true
+      };
+    })
+  );
+  const out = {};
+  settled.forEach((r, i) => {
+    out[symbols[i]] = r.status === 'fulfilled' ? r.value : { error: r.reason.message };
+  });
+  res.json(out);
+});
 
 // GET /api/check/:symbol
 // Contrasta la cotización y el histórico para detectar datos incoherentes o atrasados.
