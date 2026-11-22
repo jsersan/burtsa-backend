@@ -560,4 +560,4 @@ Distribuido bajo la licencia [MIT / Apache-2.0 / privada]. Consulta el archivo `
 - **Autor:** [jsersan](https://github.com/jsersan)
 - **Repositorio:** https://github.com/jsersan/burtsa-backend
 - **Issues:** https://github.com/jsersan/burtsa-backend/issues
-- **Email:** [tu-email@ejemplo.com]
+- **Email:** [jsersan@gmail.com]
